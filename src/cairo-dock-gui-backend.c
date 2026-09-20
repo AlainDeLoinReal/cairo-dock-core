@@ -24,6 +24,11 @@
 #include <glib/gstdio.h>
 #include <glib/gi18n.h>
 
+#include "gldi-config.h"
+#ifdef HAVE_X11
+#include <gdk/gdkx.h>
+#endif
+
 #include "gldi-icon-names.h"
 #include "cairo-dock-keyfile-utilities.h"
 #include "cairo-dock-gui-advanced.h"
@@ -40,6 +45,15 @@ extern CairoDock *g_pMainDock;
 
 static CairoDockMainGuiBackend *s_pMainGuiBackend = NULL;
 static int s_iCurrentMode = 0;
+
+static gboolean _gui_uses_x11_backend (G_GNUC_UNUSED GtkWidget *pWidget)
+{
+#ifdef HAVE_X11
+	return GDK_IS_X11_DISPLAY (gtk_widget_get_display (pWidget));
+#else
+	return FALSE;
+#endif
+}
 
 void cairo_dock_load_user_gui_backend (int iMode)  // 0 = simple
 {
@@ -88,8 +102,6 @@ static gboolean _restore_switched_gui_geometry (gpointer data)
 		pGeometry->iWidth,
 		pGeometry->iHeight);
 
-	gtk_window_present (GTK_WINDOW (pGeometry->pWindow));
-
 	pGeometry->iAttempts++;
 
 	/* XWayland/KWin can reposition the newly mapped window shortly
@@ -113,7 +125,8 @@ static void on_click_switch_mode (GtkButton *button, G_GNUC_UNUSED gpointer data
 	gint iWidth = 0;
 	gint iHeight = 0;
 
-	gboolean bHaveGeometry = GTK_IS_WINDOW (pOldWindow);
+	gboolean bHaveGeometry = GTK_IS_WINDOW (pOldWindow) &&
+		_gui_uses_x11_backend (pOldWindow);
 
 	if (bHaveGeometry)
 	{
@@ -407,7 +420,6 @@ static void _move_gui_window_to_visible_monitor (GtkWindow *pWindow)
 		iY += (area.height - iHeight) / 2;
 
 	gtk_window_move (pWindow, iX, iY);
-	gtk_window_present (pWindow);
 }
 
 static gboolean _ensure_gui_window_visible (gpointer data)
@@ -445,7 +457,7 @@ GtkWidget * cairo_dock_show_main_gui (void)
 	
 	_display_window (pWindow);
 	
-	if (GTK_IS_WINDOW (pWindow))
+	if (GTK_IS_WINDOW (pWindow) && _gui_uses_x11_backend (pWindow))
 	{
 		CairoDockGuiVisibilityCheck *pCheck =
 			g_new0 (CairoDockGuiVisibilityCheck, 1);
