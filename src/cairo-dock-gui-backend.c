@@ -59,8 +59,68 @@ int cairo_dock_gui_backend_get_mode ()
 	return s_iCurrentMode;
 }
 
-static void on_click_switch_mode (G_GNUC_UNUSED GtkButton *button, G_GNUC_UNUSED gpointer data)
+typedef struct
 {
+	GtkWidget *pWindow;
+	gint iX;
+	gint iY;
+	gint iWidth;
+	gint iHeight;
+	guint iAttempts;
+} CairoDockGuiWindowGeometry;
+
+static gboolean _restore_switched_gui_geometry (gpointer data)
+{
+	CairoDockGuiWindowGeometry *pGeometry = data;
+
+	if (! GTK_IS_WINDOW (pGeometry->pWindow))
+	{
+		g_object_unref (pGeometry->pWindow);
+		g_free (pGeometry);
+		return G_SOURCE_REMOVE;
+	}
+
+	gtk_window_move (GTK_WINDOW (pGeometry->pWindow),
+		pGeometry->iX,
+		pGeometry->iY);
+
+	gtk_window_resize (GTK_WINDOW (pGeometry->pWindow),
+		pGeometry->iWidth,
+		pGeometry->iHeight);
+
+	gtk_window_present (GTK_WINDOW (pGeometry->pWindow));
+
+	pGeometry->iAttempts++;
+
+	/* XWayland/KWin can reposition the newly mapped window shortly
+	 * after GTK creates it, so repeat the requested geometry a few
+	 * times after the window has appeared. */
+	if (pGeometry->iAttempts < 5)
+		return G_SOURCE_CONTINUE;
+
+	g_object_unref (pGeometry->pWindow);
+	g_free (pGeometry);
+
+	return G_SOURCE_REMOVE;
+}
+
+static void on_click_switch_mode (GtkButton *button, G_GNUC_UNUSED gpointer data)
+{
+	GtkWidget *pOldWindow = gtk_widget_get_toplevel (GTK_WIDGET (button));
+
+	gint iX = 0;
+	gint iY = 0;
+	gint iWidth = 0;
+	gint iHeight = 0;
+
+	gboolean bHaveGeometry = GTK_IS_WINDOW (pOldWindow);
+
+	if (bHaveGeometry)
+	{
+		gtk_window_get_position (GTK_WINDOW (pOldWindow), &iX, &iY);
+		gtk_window_get_size (GTK_WINDOW (pOldWindow), &iWidth, &iHeight);
+	}
+
 	cairo_dock_close_gui ();
 	
 	int iNewMode = (s_iCurrentMode == 1 ? 0 : 1);
@@ -73,7 +133,28 @@ static void on_click_switch_mode (G_GNUC_UNUSED GtkButton *button, G_GNUC_UNUSED
 	
 	cairo_dock_load_user_gui_backend (iNewMode);
 	
-	cairo_dock_show_main_gui ();
+	GtkWidget *pNewWindow = cairo_dock_show_main_gui ();
+
+	if (bHaveGeometry && GTK_IS_WINDOW (pNewWindow))
+	{
+		/* Do it once immediately... */
+		gtk_window_move (GTK_WINDOW (pNewWindow), iX, iY);
+		gtk_window_resize (GTK_WINDOW (pNewWindow), iWidth, iHeight);
+
+		/* ...and then keep enforcing it briefly while XWayland/KWin
+		 * finishes mapping the new window. */
+		CairoDockGuiWindowGeometry *pGeometry =
+			g_new0 (CairoDockGuiWindowGeometry, 1);
+
+		pGeometry->pWindow = g_object_ref (pNewWindow);
+		pGeometry->iX = iX;
+		pGeometry->iY = iY;
+		pGeometry->iWidth = iWidth;
+		pGeometry->iHeight = iHeight;
+		pGeometry->iAttempts = 0;
+
+		g_timeout_add (200, _restore_switched_gui_geometry, pGeometry);
+	}
 }
 GtkWidget *cairo_dock_make_switch_gui_button (void)
 {
@@ -233,6 +314,128 @@ static void _display_window (GtkWidget *pWindow)
 	gtk_window_present (GTK_WINDOW (pWindow));
 }
 
+typedef struct
+{
+	GtkWidget *pWindow;
+	guint iAttempts;
+} CairoDockGuiVisibilityCheck;
+
+static gboolean _gui_window_is_on_a_monitor (GtkWindow *pWindow)
+{
+	gint iX, iY, iWidth, iHeight;
+	gtk_window_get_position (pWindow, &iX, &iY);
+	gtk_window_get_size (pWindow, &iWidth, &iHeight);
+
+	gint iCenterX = iX + iWidth / 2;
+	gint iCenterY = iY + iHeight / 2;
+
+	GdkDisplay *pDisplay = gtk_widget_get_display (GTK_WIDGET (pWindow));
+	gint iNbMonitors = gdk_display_get_n_monitors (pDisplay);
+
+	for (gint i = 0; i < iNbMonitors; i++)
+	{
+		GdkMonitor *pMonitor = gdk_display_get_monitor (pDisplay, i);
+		if (pMonitor == NULL)
+			continue;
+
+		GdkRectangle area;
+		gdk_monitor_get_workarea (pMonitor, &area);
+
+		if (iCenterX >= area.x &&
+			iCenterX < area.x + area.width &&
+			iCenterY >= area.y &&
+			iCenterY < area.y + area.height)
+		{
+			return TRUE;
+		}
+	}
+
+	return FALSE;
+}
+
+static GdkMonitor *_get_gui_target_monitor (GtkWindow *pWindow)
+{
+	GdkDisplay *pDisplay = gtk_widget_get_display (GTK_WIDGET (pWindow));
+	GdkMonitor *pMonitor = NULL;
+
+	GdkSeat *pSeat = gdk_display_get_default_seat (pDisplay);
+	if (pSeat != NULL)
+	{
+		GdkDevice *pPointer = gdk_seat_get_pointer (pSeat);
+
+		if (pPointer != NULL)
+		{
+			gint iPointerX = 0;
+			gint iPointerY = 0;
+
+			gdk_device_get_position (pPointer, NULL,
+				&iPointerX, &iPointerY);
+
+			pMonitor = gdk_display_get_monitor_at_point (
+				pDisplay, iPointerX, iPointerY);
+		}
+	}
+
+	if (pMonitor == NULL)
+		pMonitor = gdk_display_get_primary_monitor (pDisplay);
+
+	if (pMonitor == NULL && gdk_display_get_n_monitors (pDisplay) > 0)
+		pMonitor = gdk_display_get_monitor (pDisplay, 0);
+
+	return pMonitor;
+}
+
+static void _move_gui_window_to_visible_monitor (GtkWindow *pWindow)
+{
+	GdkMonitor *pMonitor = _get_gui_target_monitor (pWindow);
+	if (pMonitor == NULL)
+		return;
+
+	GdkRectangle area;
+	gdk_monitor_get_workarea (pMonitor, &area);
+
+	gint iWidth, iHeight;
+	gtk_window_get_size (pWindow, &iWidth, &iHeight);
+
+	gint iX = area.x;
+	gint iY = area.y;
+
+	if (area.width > iWidth)
+		iX += (area.width - iWidth) / 2;
+
+	if (area.height > iHeight)
+		iY += (area.height - iHeight) / 2;
+
+	gtk_window_move (pWindow, iX, iY);
+	gtk_window_present (pWindow);
+}
+
+static gboolean _ensure_gui_window_visible (gpointer data)
+{
+	CairoDockGuiVisibilityCheck *pCheck = data;
+
+	if (! GTK_IS_WINDOW (pCheck->pWindow) ||
+		gtk_widget_in_destruction (pCheck->pWindow))
+	{
+		g_object_unref (pCheck->pWindow);
+		g_free (pCheck);
+		return G_SOURCE_REMOVE;
+	}
+
+	if (! _gui_window_is_on_a_monitor (GTK_WINDOW (pCheck->pWindow)))
+		_move_gui_window_to_visible_monitor (GTK_WINDOW (pCheck->pWindow));
+
+	pCheck->iAttempts++;
+
+	if (pCheck->iAttempts < 8)
+		return G_SOURCE_CONTINUE;
+
+	g_object_unref (pCheck->pWindow);
+	g_free (pCheck);
+
+	return G_SOURCE_REMOVE;
+}
+
 GtkWidget * cairo_dock_show_main_gui (void)
 {
 	// create the window
@@ -242,6 +445,17 @@ GtkWidget * cairo_dock_show_main_gui (void)
 	
 	_display_window (pWindow);
 	
+	if (GTK_IS_WINDOW (pWindow))
+	{
+		CairoDockGuiVisibilityCheck *pCheck =
+			g_new0 (CairoDockGuiVisibilityCheck, 1);
+
+		pCheck->pWindow = g_object_ref (pWindow);
+		pCheck->iAttempts = 0;
+
+		g_timeout_add (120, _ensure_gui_window_visible, pCheck);
+	}
+
 	return pWindow;
 }
 
