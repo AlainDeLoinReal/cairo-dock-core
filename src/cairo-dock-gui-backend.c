@@ -87,7 +87,8 @@ static gboolean _restore_switched_gui_geometry (gpointer data)
 {
 	CairoDockGuiWindowGeometry *pGeometry = data;
 
-	if (! GTK_IS_WINDOW (pGeometry->pWindow))
+	if (! GTK_IS_WINDOW (pGeometry->pWindow) ||
+		gtk_widget_in_destruction (pGeometry->pWindow))
 	{
 		g_object_unref (pGeometry->pWindow);
 		g_free (pGeometry);
